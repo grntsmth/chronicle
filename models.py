@@ -1,8 +1,23 @@
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import config
+
+
+def to_local(iso_str: str | None) -> datetime | None:
+    """Parse an ISO 8601 string and return a tz-aware datetime in USER_TIMEZONE.
+    Strings with no offset and no Z are treated as UTC — Outlook's sync stores
+    times that way (Microsoft Graph drops the timeZone field separately)."""
+    if not iso_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(config.USER_TIMEZONE)
 
 
 def get_db() -> sqlite3.Connection:

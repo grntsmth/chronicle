@@ -25,10 +25,10 @@ recently_created = set()
 
 
 def format_event_line(e: dict) -> str:
-    try:
-        dt = datetime.fromisoformat(e["start_time"].replace("Z", "+00:00"))
+    dt = models.to_local(e["start_time"])
+    if dt:
         time_str = dt.strftime("%I:%M %p")
-    except (ValueError, AttributeError):
+    else:
         time_str = "All day" if e.get("all_day") else "?"
     source_icon = "\U0001f535" if e["source"] == "google" else "\U0001f7e0"
     loc = f" @ {e['location']}" if e.get("location") else ""
@@ -354,11 +354,8 @@ async def cmd_add(ctx, *, text: str):
     # Summary response
     if created == 1 and len(parsed_list) == 1:
         p = parsed_list[0]
-        try:
-            dt = datetime.fromisoformat(p.get("start", "").replace("Z", "+00:00"))
-            time_str = dt.strftime("%a %b %d, %I:%M %p")
-        except (ValueError, AttributeError):
-            time_str = p.get("start", "?")
+        dt = models.to_local(p.get("start", ""))
+        time_str = dt.strftime("%a %b %d, %I:%M %p") if dt else p.get("start", "?")
 
         embed = discord.Embed(
             title=f"Event Created: {p.get('summary', '?')}",

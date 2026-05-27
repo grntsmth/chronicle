@@ -95,6 +95,17 @@ def get_access_token() -> str | None:
     return token.get("access_token")
 
 
+def _iso_with_tz(dt_obj: dict) -> str:
+    """Microsoft Graph returns {dateTime, timeZone} pairs. The dateTime field
+    carries no tz suffix; if we store it as-is, downstream parsers treat it as
+    naive local time and the clock-time displays in UTC. Tag UTC responses with
+    Z so to_local() can correctly convert them."""
+    dt = dt_obj.get("dateTime", "")
+    if dt and dt_obj.get("timeZone") == "UTC" and not dt.endswith("Z"):
+        return dt + "Z"
+    return dt
+
+
 def parse_event(event: dict) -> dict:
     start = event.get("start", {})
     end = event.get("end", {})
@@ -108,8 +119,8 @@ def parse_event(event: dict) -> dict:
         "title": event.get("subject", "(No title)"),
         "description": event.get("bodyPreview", ""),
         "location": event.get("location", {}).get("displayName", ""),
-        "start_time": start.get("dateTime", ""),
-        "end_time": end.get("dateTime", ""),
+        "start_time": _iso_with_tz(start),
+        "end_time": _iso_with_tz(end),
         "all_day": 1 if all_day else 0,
         "status": "cancelled" if event.get("isCancelled") else "confirmed",
         "raw_json": json.dumps(event),
@@ -130,7 +141,10 @@ def sync_calendar() -> int:
     time_max = (now + timedelta(days=90)).isoformat() + "Z"
 
     try:
-        headers = {"Authorization": f"Bearer {access_token}"}
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Prefer": 'outlook.timezone="UTC"',
+        }
         params = {
             "$select": "id,subject,bodyPreview,start,end,location,isAllDay,isCancelled",
             "$orderby": "start/dateTime",

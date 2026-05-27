@@ -40,13 +40,25 @@ pip install -r requirements.txt
 
 # Provide config via env vars — see config.py for the full list:
 #   GOOGLE_CREDS_FILE, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID,
-#   DISCORD_BOT_TOKEN, DISCORD_WEBHOOK_URL, ANTHROPIC_API_KEY, OLLAMA_URL
+#   DISCORD_BOT_TOKEN, DISCORD_WEBHOOK_URL, ANTHROPIC_API_KEY, OLLAMA_URL,
+#   USER_TIMEZONE (default America/New_York), USER_CONTEXT (see Personalization)
 export $(cat .env | xargs)
 
 uvicorn app:app --reload --port 8090
 ```
 
 Hit `/chronicle/oauth/google` and `/chronicle/oauth/outlook` once each to seed the OAuth tokens; refresh is handled thereafter. If a refresh token is revoked or a client secret expires, the next tokenless resync will reap any events that disappeared during the outage so the LLM stops referencing deleted events.
+
+## Personalization
+
+The LLM analysis prompt is composed at startup from two pieces, both edited without touching the rest of the code:
+
+- **`USER_CONTEXT`** (env var) — free-form facts about you. The default tells the model the user works at JPMorgan Chase as a bank teller; override with whatever helps the model interpret your titles in context (employer, recurring locations, people you live with, etc.).
+- **Title keyword table** in `llm.py` (inside `SYSTEM_PROMPT`) — a short mapping of trigger words to event categories: `Shift` → work shift, `Meeting` → meeting, `Appointment` → service appointment, `Bill` → cost flag, and so on. Add or edit rows to teach the model your personal vocabulary.
+
+The combination kills the hedging that a fresh LLM produces on bare titles like "JPMC Shift" — between user-level context and title-level keywords, the model classifies confidently instead of asking "is this a meeting or a shift?".
+
+Times are rendered in `USER_TIMEZONE` (default `America/New_York`); Outlook events are normalized to UTC on sync and converted to local for display, so the model sees consistent clock times across both calendars.
 
 ## Status
 

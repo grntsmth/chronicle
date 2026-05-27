@@ -1,7 +1,18 @@
 import os
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 BASE_DIR = Path(__file__).parent
+
+USER_TIMEZONE = ZoneInfo(os.getenv("USER_TIMEZONE", "America/New_York"))
+
+# Free-form facts about the user, injected into the LLM system prompt so it can
+# interpret event titles in context. Override via env var without redeploying.
+USER_CONTEXT = os.getenv(
+    "USER_CONTEXT",
+    "The user works at JPMorgan Chase as a bank teller; events titled 'JPMC Shift' "
+    "are work shifts at a Chase Bank branch. The user is based in the Eastern US.",
+)
 
 # --- Google Calendar ---
 GOOGLE_CREDS_FILE = os.getenv("GOOGLE_CREDS_FILE", str(BASE_DIR / "google-creds.json"))

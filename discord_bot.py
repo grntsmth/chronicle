@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 import httpx
 
 import config
-from models import get_db, get_upcoming_events, get_events_range
+from models import get_db, get_upcoming_events, get_events_range, to_local
 
 log = logging.getLogger("chronicle.discord")
 
@@ -57,12 +57,8 @@ def notify_event_change(event: dict, change_type: str):
         "cancelled": "Event Cancelled",
     }
 
-    start = event.get("start_time", "")
-    try:
-        dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
-        time_str = dt.strftime("%a %b %d, %I:%M %p")
-    except (ValueError, AttributeError):
-        time_str = start
+    dt = to_local(event.get("start_time"))
+    time_str = dt.strftime("%a %b %d, %I:%M %p %Z") if dt else event.get("start_time", "")
 
     fields = [
         {"name": "When", "value": time_str, "inline": True},
@@ -98,10 +94,10 @@ def send_daily_briefing():
 
     lines = []
     for e in events:
-        try:
-            dt = datetime.fromisoformat(e["start_time"].replace("Z", "+00:00"))
+        dt = to_local(e["start_time"])
+        if dt:
             time_str = dt.strftime("%I:%M %p")
-        except (ValueError, AttributeError):
+        else:
             time_str = "All day" if e.get("all_day") else "?"
         source_icon = "🔵" if e["source"] == "google" else "🟠"
         lines.append(f"{source_icon} **{time_str}** — {e['title']}")

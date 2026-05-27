@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 import httpx
 
 import config
-from models import get_db, get_upcoming_events, get_events_range
+from models import get_db, get_upcoming_events, get_events_range, to_local
 
 log = logging.getLogger("chronicle.llm")
 
@@ -80,15 +80,25 @@ def query_llm(prompt: str, system: str = "", max_tokens: int = 2048) -> str | No
     return query_ollama(prompt, system)
 
 
-SYSTEM_PROMPT = """You are The Chronicle, a personal calendar assistant. You analyze schedules and provide actionable insights.
+SYSTEM_PROMPT = f"""You are The Chronicle, a personal calendar assistant. You analyze schedules and provide actionable insights.
 
-Be concise and direct. Use bullet points. Focus on:
-- Conflicts and overlaps
-- Gaps that could be used productively
-- Preparation needed for upcoming events
-- Scheduling suggestions
+USER CONTEXT
+{config.USER_CONTEXT}
 
-Never be generic. Reference specific events by name and time."""
+TITLE KEYWORDS — when an event title contains one of these words, classify the event accordingly. Titles without a matching keyword are interpreted normally from available context.
+
+| Keyword | Meaning |
+|---|---|
+| Shift | A work shift. The user is unavailable for personal scheduling during the start–end window. |
+| Meeting | A scheduled meeting (work or personal). |
+| Appointment | An appointment with a service provider — medical, dental, automotive, etc. Plan commute + buffer time. |
+| Date | DEFCON 5 emergency situation: the user has somehow secured a date. Treat with appropriate gravity and unwavering enthusiasm. |
+| Bill | An upcoming cost / payment due. Not a time commitment but a financial obligation to flag. |
+
+GUIDELINES
+- Be concise and direct. Use bullet points.
+- Focus on conflicts and overlaps, productive gaps, preparation needed, and scheduling suggestions.
+- Never be generic. Reference specific events by name and time."""
 
 
 def analyze_schedule(hours: int = 24) -> str | None:
@@ -101,20 +111,26 @@ def analyze_schedule(hours: int = 24) -> str | None:
 
     event_lines = []
     for e in events:
-        try:
-            dt = datetime.fromisoformat(e["start_time"].replace("Z", "+00:00"))
-            time_str = dt.strftime("%a %b %d %I:%M %p")
-        except (ValueError, AttributeError):
+        start_dt = to_local(e["start_time"])
+        end_dt = to_local(e.get("end_time"))
+        if start_dt and end_dt and start_dt.date() == end_dt.date():
+            time_str = f'{start_dt.strftime("%a %b %d %I:%M %p")}–{end_dt.strftime("%I:%M %p %Z")}'
+        elif start_dt and end_dt:
+            time_str = f'{start_dt.strftime("%a %b %d %I:%M %p")} → {end_dt.strftime("%a %b %d %I:%M %p %Z")}'
+        elif start_dt:
+            time_str = start_dt.strftime("%a %b %d %I:%M %p %Z")
+        else:
             time_str = e["start_time"]
         desc = (e.get("description") or "").replace("\n", " ").strip()
         desc_part = f" — {desc[:200]}" if desc else ""
         event_lines.append(f"- {time_str}: {e['title']} ({e['source']}){' @ ' + e['location'] if e['location'] else ''}{desc_part}")
 
+    now_local = datetime.now(config.USER_TIMEZONE)
     prompt = f"""Here are the upcoming events for the next {hours} hours:
 
 {chr(10).join(event_lines)}
 
-Current time: {datetime.utcnow().strftime('%A, %B %d %Y %I:%M %p')} UTC
+Current time: {now_local.strftime('%A, %B %d %Y %I:%M %p %Z')}
 
 Analyze this schedule. Identify conflicts, suggest optimizations, and note any preparation needed."""
 
@@ -124,9 +140,8 @@ Analyze this schedule. Identify conflicts, suggest optimizations, and note any p
 def analyze_change(event: dict, change_type: str, all_events: list[dict], window_hours: int = 24) -> str | None:
     """Analyze the impact of a calendar change in context of other events within
     ±window_hours of the change event's start time."""
-    try:
-        change_dt = datetime.fromisoformat(event["start_time"].replace("Z", "+00:00"))
-    except (ValueError, AttributeError, KeyError):
+    change_dt = to_local(event.get("start_time"))
+    if change_dt is None:
         return None
 
     window = timedelta(hours=window_hours)
@@ -134,9 +149,8 @@ def analyze_change(event: dict, change_type: str, all_events: list[dict], window
     for e in all_events:
         if e["id"] == event["id"]:
             continue
-        try:
-            e_dt = datetime.fromisoformat(e["start_time"].replace("Z", "+00:00"))
-        except (ValueError, AttributeError):
+        e_dt = to_local(e.get("start_time"))
+        if e_dt is None:
             continue
         if abs(e_dt - change_dt) <= window:
             nearby.append((e_dt, e))
@@ -147,15 +161,17 @@ def analyze_change(event: dict, change_type: str, all_events: list[dict], window
     nearby.sort(key=lambda x: x[0])
     other_lines = []
     for e_dt, e in nearby[:15]:
-        time_str = e_dt.strftime("%a %b %d %Y, %I:%M %p")
+        time_str = e_dt.strftime("%a %b %d %Y, %I:%M %p %Z")
         desc = (e.get("description") or "").replace("\n", " ").strip()
         desc_part = f" — {desc[:200]}" if desc else ""
         other_lines.append(f"- {time_str}: {e['title']}{desc_part}")
 
-    change_time_str = change_dt.strftime("%a %b %d %Y, %I:%M %p")
+    change_time_str = change_dt.strftime("%a %b %d %Y, %I:%M %p %Z")
+    end_dt = to_local(event.get("end_time"))
+    end_str = end_dt.strftime("%I:%M %p %Z") if end_dt else event.get("end_time", "?")
     prompt = f"""A calendar event was {change_type}:
 - Title: {event.get('title', '?')}
-- Time: {change_time_str} (ends {event.get('end_time', '?')})
+- Time: {change_time_str} (ends {end_str})
 - Location: {event.get('location', 'none')}
 
 Other events within ±{window_hours}h of that time:
@@ -204,21 +220,21 @@ def analyze_period(period: str = "week") -> str | None:
     # Group by day
     days = {}
     for e in events:
-        try:
-            dt = datetime.fromisoformat(e["start_time"].replace("Z", "+00:00"))
-            day_key = dt.strftime("%a %b %d")
-        except (ValueError, AttributeError):
-            day_key = "Unknown"
+        dt = to_local(e["start_time"])
+        day_key = dt.strftime("%a %b %d") if dt else "Unknown"
         days.setdefault(day_key, []).append(e)
 
     lines = []
     for day, day_events in days.items():
         lines.append(f"\n{day}:")
         for e in day_events:
-            try:
-                dt = datetime.fromisoformat(e["start_time"].replace("Z", "+00:00"))
-                time_str = dt.strftime("%I:%M %p")
-            except (ValueError, AttributeError):
+            start_dt = to_local(e["start_time"])
+            end_dt = to_local(e.get("end_time"))
+            if start_dt and end_dt:
+                time_str = f'{start_dt.strftime("%I:%M %p")}–{end_dt.strftime("%I:%M %p")}'
+            elif start_dt:
+                time_str = start_dt.strftime("%I:%M %p")
+            else:
                 time_str = "?"
             desc = (e.get("description") or "").replace("\n", " ").strip()
             desc_part = f" — {desc[:200]}" if desc else ""
