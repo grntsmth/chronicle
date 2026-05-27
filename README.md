@@ -25,7 +25,7 @@ Built to solve a personal problem — my work calendar (Outlook) and personal ca
 
 ## Deployment
 
-Runs in the `ecosystem` namespace of my homelab k3s cluster. See [GRANTUR/homelab](https://github.com/GRANTUR/homelab) for the cluster itself. The manifests in `k8s/` are:
+Runs in the `ecosystem` namespace of my homelab k3s cluster. See [grntsmth/homelab](https://github.com/grntsmth/homelab) for the cluster itself. The manifests in `k8s/` are:
 
 - `chronicle.yml` — Deployment, PVC for the SQLite DB, Service.
 - `traefik-chronicle.yml` — IngressRoute exposing the FastAPI endpoints for OAuth callbacks.
