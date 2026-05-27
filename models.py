@@ -1,5 +1,5 @@
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import config
@@ -98,13 +98,14 @@ def upsert_event(conn: sqlite3.Connection, event: dict) -> bool:
 
 
 def get_upcoming_events(conn: sqlite3.Connection, hours: int = 24) -> list[dict]:
-    now = datetime.utcnow().isoformat()
+    now = datetime.utcnow()
+    horizon = (now + timedelta(hours=hours)).isoformat()
     rows = conn.execute("""
         SELECT * FROM events
-        WHERE start_time >= ? AND status != 'cancelled'
+        WHERE start_time >= ? AND start_time < ? AND status != 'cancelled'
         ORDER BY start_time
         LIMIT 50
-    """, (now,)).fetchall()
+    """, (now.isoformat(), horizon)).fetchall()
     return [dict(r) for r in rows]
 
 

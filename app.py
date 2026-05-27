@@ -111,6 +111,19 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.warning(f"Initial sync failed (may need OAuth): {e}")
 
+    # Register webhooks shortly after the server starts accepting traffic. Graph
+    # does a synchronous validation handshake against our notificationUrl; if we
+    # call setup_webhook before yield, the server isn't serving yet and Graph
+    # gets a BadGateway. Sleep briefly so uvicorn is ready, then run.
+    async def deferred_webhook_setup():
+        await asyncio.sleep(5)
+        try:
+            await job_renew_webhooks()
+        except Exception as e:
+            log.warning(f"Initial webhook setup failed: {e}")
+
+    webhook_task = asyncio.create_task(deferred_webhook_setup())
+
     # Start Discord bot in background
     bot_task = asyncio.create_task(discord_bot_client.start_bot())
 

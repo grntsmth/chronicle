@@ -121,33 +121,47 @@ Analyze this schedule. Identify conflicts, suggest optimizations, and note any p
     return query_llm(prompt, SYSTEM_PROMPT)
 
 
-def analyze_change(event: dict, change_type: str, all_events: list[dict]) -> str | None:
-    """Analyze the impact of a calendar change in context of other events."""
-    other_events = [e for e in all_events if e["id"] != event["id"]]
-
-    if not other_events:
+def analyze_change(event: dict, change_type: str, all_events: list[dict], window_hours: int = 24) -> str | None:
+    """Analyze the impact of a calendar change in context of other events within
+    ±window_hours of the change event's start time."""
+    try:
+        change_dt = datetime.fromisoformat(event["start_time"].replace("Z", "+00:00"))
+    except (ValueError, AttributeError, KeyError):
         return None
 
-    other_lines = []
-    for e in other_events[:15]:
+    window = timedelta(hours=window_hours)
+    nearby = []
+    for e in all_events:
+        if e["id"] == event["id"]:
+            continue
         try:
-            dt = datetime.fromisoformat(e["start_time"].replace("Z", "+00:00"))
-            time_str = dt.strftime("%a %I:%M %p")
+            e_dt = datetime.fromisoformat(e["start_time"].replace("Z", "+00:00"))
         except (ValueError, AttributeError):
-            time_str = e["start_time"]
+            continue
+        if abs(e_dt - change_dt) <= window:
+            nearby.append((e_dt, e))
+
+    if not nearby:
+        return None
+
+    nearby.sort(key=lambda x: x[0])
+    other_lines = []
+    for e_dt, e in nearby[:15]:
+        time_str = e_dt.strftime("%a %b %d %Y, %I:%M %p")
         desc = (e.get("description") or "").replace("\n", " ").strip()
         desc_part = f" — {desc[:200]}" if desc else ""
         other_lines.append(f"- {time_str}: {e['title']}{desc_part}")
 
+    change_time_str = change_dt.strftime("%a %b %d %Y, %I:%M %p")
     prompt = f"""A calendar event was {change_type}:
 - Title: {event.get('title', '?')}
-- Time: {event.get('start_time', '?')} to {event.get('end_time', '?')}
+- Time: {change_time_str} (ends {event.get('end_time', '?')})
 - Location: {event.get('location', 'none')}
 
-Other events around that time:
+Other events within ±{window_hours}h of that time:
 {chr(10).join(other_lines)}
 
-Does this change create any conflicts? Does anything need to be rescheduled? Any preparation needed? If no issues, say so briefly."""
+Does this change create any real conflicts? Only flag overlaps or tight back-to-backs on the SAME DAY as the change. Events on different days are not conflicts. If no issues, say so briefly."""
 
     return query_llm(prompt, SYSTEM_PROMPT)
 

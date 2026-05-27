@@ -207,16 +207,47 @@ def create_event(subject: str, start: str, end: str, description: str = "",
     return None
 
 
+def list_subscriptions(access_token: str) -> list[dict]:
+    """List all Graph subscriptions for this account."""
+    headers = {"Authorization": f"Bearer {access_token}"}
+    resp = httpx.get(f"{GRAPH_BASE}/subscriptions", headers=headers)
+    if resp.status_code == 200:
+        return resp.json().get("value", [])
+    log.warning(f"Failed to list Outlook subscriptions: {resp.status_code} {resp.text}")
+    return []
+
+
+def delete_subscription(access_token: str, sub_id: str) -> bool:
+    """Delete a Graph subscription by ID."""
+    headers = {"Authorization": f"Bearer {access_token}"}
+    resp = httpx.delete(f"{GRAPH_BASE}/subscriptions/{sub_id}", headers=headers)
+    if resp.status_code in (204, 404):
+        return True
+    log.warning(f"Failed to delete subscription {sub_id}: {resp.status_code} {resp.text}")
+    return False
+
+
 def setup_webhook() -> dict | None:
-    """Register a Graph API subscription for calendar changes."""
+    """Register a Graph subscription, deleting any prior ones pointing at our URL.
+    Graph does not enforce uniqueness — renewing without deleting stacks duplicates."""
     access_token = get_access_token()
     if not access_token:
         return None
 
+    our_url = f"{config.WEBHOOK_BASE_URL}/webhook/outlook"
+
+    purged = 0
+    for sub in list_subscriptions(access_token):
+        if sub.get("notificationUrl") == our_url:
+            if delete_subscription(access_token, sub["id"]):
+                purged += 1
+    if purged:
+        log.info(f"Outlook webhook: purged {purged} existing subscription(s)")
+
     expiry = (datetime.utcnow() + timedelta(days=2)).isoformat() + "Z"
     body = {
         "changeType": "created,updated,deleted",
-        "notificationUrl": f"{config.WEBHOOK_BASE_URL}/webhook/outlook",
+        "notificationUrl": our_url,
         "resource": "me/events",
         "expirationDateTime": expiry,
         "clientState": "chronicle-outlook-webhook",
@@ -227,6 +258,15 @@ def setup_webhook() -> dict | None:
 
     if resp.status_code == 201:
         sub = resp.json()
+        conn = get_db()
+        conn.execute("""
+            INSERT INTO sync_state (source, calendar_id, channel_id, channel_expiry, last_sync)
+            VALUES ('outlook', 'default', ?, ?, datetime('now'))
+            ON CONFLICT(source, calendar_id) DO UPDATE SET
+                channel_id=excluded.channel_id, channel_expiry=excluded.channel_expiry
+        """, (sub["id"], expiry))
+        conn.commit()
+        conn.close()
         log.info(f"Outlook webhook registered: {sub['id']}, expires {expiry}")
         return sub
     else:
