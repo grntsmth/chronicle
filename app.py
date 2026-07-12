@@ -365,12 +365,21 @@ async def api_analyze(hours: int = Query(24)):
 
 
 @app.get("/chronicle/health")
-async def health():
-    """Health check."""
+async def health(response: Response):
+    """Health check.
+
+    Returns 503 when the primary calendar (Google) is unauthenticated or
+    the scheduler died — a constant 200 once hid a broken refresh token
+    for weeks because nothing probing this endpoint could tell the
+    difference. Outlook is optional and only reported, not gated on.
+    """
     google_ok = google_cal.get_credentials() is not None
     outlook_ok = outlook_cal.get_access_token() is not None
+    healthy = google_ok and scheduler.running
+    if not healthy:
+        response.status_code = 503
     return {
-        "status": "ok",
+        "status": "ok" if healthy else "degraded",
         "google_connected": google_ok,
         "outlook_connected": outlook_ok,
         "scheduler_running": scheduler.running,
