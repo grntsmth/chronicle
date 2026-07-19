@@ -25,11 +25,11 @@ recently_created = set()
 
 
 def format_event_line(e: dict) -> str:
-    dt = models.to_local(e["start_time"])
-    if dt:
-        time_str = dt.strftime("%I:%M %p")
+    if e.get("all_day"):
+        time_str = "All day"
     else:
-        time_str = "All day" if e.get("all_day") else "?"
+        dt = models.to_local(e["start_time"])
+        time_str = dt.strftime("%I:%M %p") if dt else "?"
     source_icon = "\U0001f535" if e["source"] == "google" else "\U0001f7e0"
     loc = f" @ {e['location']}" if e.get("location") else ""
     return f"{source_icon} **{time_str}** — {e['title']}{loc}"
@@ -169,12 +169,11 @@ async def cmd_help(ctx):
 async def cmd_today(ctx):
     """Show today's events."""
     conn = models.get_db()
-    now = datetime.utcnow()
-    start = now.replace(hour=0, minute=0, second=0).isoformat()
-    end = (now.replace(hour=0, minute=0, second=0) + timedelta(days=1)).isoformat()
+    start, end = models.local_day_range()
     events = models.get_events_range(conn, start, end)
     conn.close()
 
+    now_local = datetime.now(config.USER_TIMEZONE)
     if not events:
         embed = discord.Embed(
             title="Today — No Events",
@@ -188,7 +187,7 @@ async def cmd_today(ctx):
             description="\n".join(lines),
             color=discord_bot.AMBER,
         )
-        embed.add_field(name="Date", value=now.strftime("%A, %B %d %Y"), inline=False)
+        embed.add_field(name="Date", value=now_local.strftime("%A, %B %d %Y"), inline=False)
 
     embed.set_footer(text="The Chronicle")
     await ctx.send(embed=embed)
@@ -198,13 +197,11 @@ async def cmd_today(ctx):
 async def cmd_tomorrow(ctx):
     """Show tomorrow's events."""
     conn = models.get_db()
-    now = datetime.utcnow()
-    tom_start = (now.replace(hour=0, minute=0, second=0) + timedelta(days=1)).isoformat()
-    tom_end = (now.replace(hour=0, minute=0, second=0) + timedelta(days=2)).isoformat()
+    tom_start, tom_end = models.local_day_range(offset_days=1)
     events = models.get_events_range(conn, tom_start, tom_end)
     conn.close()
 
-    tom_date = (now + timedelta(days=1)).strftime("%A, %B %d %Y")
+    tom_date = (datetime.now(config.USER_TIMEZONE) + timedelta(days=1)).strftime("%A, %B %d %Y")
 
     if not events:
         embed = discord.Embed(
@@ -229,9 +226,7 @@ async def cmd_tomorrow(ctx):
 async def cmd_week(ctx):
     """Show the next 7 days."""
     conn = models.get_db()
-    now = datetime.utcnow()
-    start = now.replace(hour=0, minute=0, second=0).isoformat()
-    end = (now.replace(hour=0, minute=0, second=0) + timedelta(days=7)).isoformat()
+    start, end = models.local_day_range(span_days=7)
     events = models.get_events_range(conn, start, end)
     conn.close()
 
@@ -245,14 +240,11 @@ async def cmd_week(ctx):
         await ctx.send(embed=embed)
         return
 
-    # Group by day
+    # Group by local-timezone day
     days = {}
     for e in events:
-        try:
-            dt = datetime.fromisoformat(e["start_time"].replace("Z", "+00:00"))
-            day_key = dt.strftime("%A, %b %d")
-        except (ValueError, AttributeError):
-            day_key = "Unknown"
+        dt = models.to_local(e["start_time"])
+        day_key = dt.strftime("%A, %b %d") if dt else "Unknown"
         days.setdefault(day_key, []).append(e)
 
     lines = []

@@ -97,15 +97,17 @@ async def lifespan(app: FastAPI):
     models.init_db()
     log.info("Chronicle database initialized")
 
-    # Schedule jobs
+    # Schedule jobs. Cron triggers carry USER_TIMEZONE so "7 AM" stays 7 AM
+    # local across DST — the old fixed-UTC hours drifted an hour every winter.
+    tz = str(config.USER_TIMEZONE)
     scheduler.add_job(job_sync_all, "interval", minutes=config.SYNC_INTERVAL_MINUTES, id="sync_all")
-    scheduler.add_job(job_daily_briefing, "cron", hour=11, minute=0, id="daily_briefing")  # 11 UTC = 7 AM ET
+    scheduler.add_job(job_daily_briefing, "cron", hour=7, minute=0, timezone=tz, id="daily_briefing")
     scheduler.add_job(job_renew_webhooks, "interval", days=1, id="renew_webhooks")
-    scheduler.add_job(job_weekly_review, "cron", day_of_week="sun", hour=22, minute=0, id="weekly_review")  # 22 UTC = 6 PM ET Sunday
-    scheduler.add_job(job_monthly_review, "cron", day=1, hour=12, minute=0, id="monthly_review")  # 12 UTC = 8 AM ET, 1st of month
-    scheduler.add_job(job_quarterly_review, "cron", month="1,4,7,10", day=1, hour=14, minute=0, id="quarterly_review")  # 14 UTC = 10 AM ET
+    scheduler.add_job(job_weekly_review, "cron", day_of_week="sun", hour=18, minute=0, timezone=tz, id="weekly_review")
+    scheduler.add_job(job_monthly_review, "cron", day=1, hour=8, minute=0, timezone=tz, id="monthly_review")
+    scheduler.add_job(job_quarterly_review, "cron", month="1,4,7,10", day=1, hour=10, minute=0, timezone=tz, id="quarterly_review")
     scheduler.start()
-    log.info(f"Scheduler started: sync every {config.SYNC_INTERVAL_MINUTES}m, briefing at 7 AM ET, weekly review Sun 6 PM ET")
+    log.info(f"Scheduler started: sync every {config.SYNC_INTERVAL_MINUTES}m, briefing 7 AM / weekly Sun 6 PM / monthly 8 AM / quarterly 10 AM, all {tz}")
 
     # Initial sync
     try:
@@ -277,12 +279,16 @@ async def webhook_google(request: Request):
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, google_cal.sync_calendar)
 
-    # Get only actually changed future events (upsert_event now skips unchanged)
+    # Get only actually changed future events (upsert_event now skips unchanged).
+    # Cutoff is a Python-format string because updated_at/synced_at are written
+    # that way — sqlite's datetime('now') space-separated form doesn't sort
+    # against them.
     conn = models.get_db()
-    now = datetime.utcnow().isoformat()
+    now = models.utc_now_str()
+    cutoff = (datetime.utcnow() - timedelta(minutes=1)).isoformat(timespec="seconds")
     recent = conn.execute(
-        "SELECT * FROM events WHERE source='google' AND updated_at >= datetime('now', '-1 minute') AND synced_at >= datetime('now', '-1 minute') AND start_time >= ? AND status != 'cancelled' ORDER BY start_time LIMIT 3",
-        (now,)
+        "SELECT * FROM events WHERE source='google' AND updated_at >= ? AND synced_at >= ? AND start_time >= ? AND status != 'cancelled' ORDER BY start_time LIMIT 3",
+        (cutoff, cutoff, now)
     ).fetchall()
     conn.close()
 
@@ -333,10 +339,11 @@ async def webhook_outlook(request: Request):
     await loop.run_in_executor(None, outlook_cal.sync_calendar)
 
     conn = models.get_db()
-    now = datetime.utcnow().isoformat()
+    now = models.utc_now_str()
+    cutoff = (datetime.utcnow() - timedelta(minutes=1)).isoformat(timespec="seconds")
     recent = conn.execute(
-        "SELECT * FROM events WHERE source='outlook' AND updated_at >= datetime('now', '-1 minute') AND synced_at >= datetime('now', '-1 minute') AND start_time >= ? AND status != 'cancelled' ORDER BY start_time LIMIT 3",
-        (now,)
+        "SELECT * FROM events WHERE source='outlook' AND updated_at >= ? AND synced_at >= ? AND start_time >= ? AND status != 'cancelled' ORDER BY start_time LIMIT 3",
+        (cutoff, cutoff, now)
     ).fetchall()
     conn.close()
 
@@ -358,11 +365,9 @@ async def webhook_outlook(request: Request):
 
 @app.get("/chronicle/api/today", dependencies=[Depends(require_token)])
 async def api_today():
-    """Get today's events."""
+    """Get today's events (local-timezone day)."""
     conn = models.get_db()
-    now = datetime.utcnow()
-    start = now.replace(hour=0, minute=0, second=0).isoformat()
-    end = (now.replace(hour=0, minute=0, second=0) + timedelta(days=1)).isoformat()
+    start, end = models.local_day_range()
     events = models.get_events_range(conn, start, end)
     conn.close()
     return {"events": events, "count": len(events)}

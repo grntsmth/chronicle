@@ -6,7 +6,7 @@ import msal
 import httpx
 
 import config
-from models import get_db, upsert_event, mark_orphans_cancelled
+from models import get_db, upsert_event, mark_orphans_cancelled, to_utc_storage
 
 log = logging.getLogger("chronicle.outlook")
 
@@ -120,8 +120,8 @@ def parse_event(event: dict) -> dict:
         "title": event.get("subject", "(No title)"),
         "description": event.get("bodyPreview", ""),
         "location": event.get("location", {}).get("displayName", ""),
-        "start_time": _iso_with_tz(start),
-        "end_time": _iso_with_tz(end),
+        "start_time": to_utc_storage(_iso_with_tz(start), all_day),
+        "end_time": to_utc_storage(_iso_with_tz(end), all_day),
         "all_day": 1 if all_day else 0,
         "status": "cancelled" if event.get("isCancelled") else "confirmed",
         "raw_json": json.dumps(event),
@@ -198,8 +198,8 @@ def create_event(subject: str, start: str, end: str, description: str = "",
 
     body = {
         "subject": subject,
-        "start": {"dateTime": start, "timeZone": "America/New_York"},
-        "end": {"dateTime": end, "timeZone": "America/New_York"},
+        "start": {"dateTime": start, "timeZone": str(config.USER_TIMEZONE)},
+        "end": {"dateTime": end, "timeZone": str(config.USER_TIMEZONE)},
     }
     if description:
         body["body"] = {"contentType": "Text", "content": description}

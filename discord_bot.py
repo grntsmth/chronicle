@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 import httpx
 
 import config
-from models import get_db, get_upcoming_events, get_events_range, to_local
+from models import get_db, get_upcoming_events, get_events_range, to_local, local_day_range
 
 log = logging.getLogger("chronicle.discord")
 
@@ -76,11 +76,9 @@ def notify_event_change(event: dict, change_type: str):
 
 
 def send_daily_briefing():
-    """Send a morning briefing of today's events."""
+    """Send a morning briefing of today's (local-timezone) events."""
     conn = get_db()
-    now = datetime.utcnow()
-    today_start = now.replace(hour=0, minute=0, second=0).isoformat()
-    today_end = (now.replace(hour=0, minute=0, second=0) + timedelta(days=1)).isoformat()
+    today_start, today_end = local_day_range()
     events = get_events_range(conn, today_start, today_end)
     conn.close()
 
@@ -94,19 +92,20 @@ def send_daily_briefing():
 
     lines = []
     for e in events:
-        dt = to_local(e["start_time"])
-        if dt:
-            time_str = dt.strftime("%I:%M %p")
+        if e.get("all_day"):
+            time_str = "All day"
         else:
-            time_str = "All day" if e.get("all_day") else "?"
+            dt = to_local(e["start_time"])
+            time_str = dt.strftime("%I:%M %p") if dt else "?"
         source_icon = "🔵" if e["source"] == "google" else "🟠"
         lines.append(f"{source_icon} **{time_str}** — {e['title']}")
 
+    now_local = datetime.now(config.USER_TIMEZONE)
     send_embed(
         title=f"Daily Briefing — {len(events)} Events",
         description="\n".join(lines),
         color=AMBER,
-        fields=[{"name": "Date", "value": now.strftime("%A, %B %d %Y"), "inline": False}],
+        fields=[{"name": "Date", "value": now_local.strftime("%A, %B %d %Y"), "inline": False}],
     )
 
 

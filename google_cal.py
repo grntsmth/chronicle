@@ -9,7 +9,7 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 
 import config
-from models import get_db, upsert_event, mark_orphans_cancelled
+from models import get_db, upsert_event, mark_orphans_cancelled, to_utc_storage
 
 log = logging.getLogger("chronicle.google")
 
@@ -72,8 +72,8 @@ def parse_event(event: dict, calendar_id: str) -> dict:
         "title": event.get("summary", "(No title)"),
         "description": event.get("description", ""),
         "location": event.get("location", ""),
-        "start_time": start_time,
-        "end_time": end_time,
+        "start_time": to_utc_storage(start_time, all_day),
+        "end_time": to_utc_storage(end_time, all_day),
         "all_day": 1 if all_day else 0,
         "status": event.get("status", "confirmed"),
         "raw_json": json.dumps(event),
@@ -178,8 +178,8 @@ def create_event(summary: str, start: str, end: str, description: str = "", loca
 
     body = {
         "summary": summary,
-        "start": {"dateTime": start, "timeZone": "America/New_York"},
-        "end": {"dateTime": end, "timeZone": "America/New_York"},
+        "start": {"dateTime": start, "timeZone": str(config.USER_TIMEZONE)},
+        "end": {"dateTime": end, "timeZone": str(config.USER_TIMEZONE)},
     }
     if description:
         body["description"] = description

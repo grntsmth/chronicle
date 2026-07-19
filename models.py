@@ -7,8 +7,8 @@ import config
 
 def to_local(iso_str: str | None) -> datetime | None:
     """Parse an ISO 8601 string and return a tz-aware datetime in USER_TIMEZONE.
-    Strings with no offset and no Z are treated as UTC — Outlook's sync stores
-    times that way (Microsoft Graph drops the timeZone field separately)."""
+    Strings with no offset and no Z are treated as UTC — the canonical storage
+    format (see to_utc_storage) is naive UTC."""
     if not iso_str:
         return None
     try:
@@ -18,6 +18,48 @@ def to_local(iso_str: str | None) -> datetime | None:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(config.USER_TIMEZONE)
+
+
+def to_utc_storage(iso_str: str | None, all_day: bool = False) -> str:
+    """Normalize any provider timestamp to the canonical storage form:
+    naive UTC 'YYYY-MM-DDTHH:MM:SS'.
+
+    start_time/end_time are TEXT compared lexicographically in SQL, so every
+    row must use one format — Google's offset strings ('...-04:00'), Outlook's
+    'Z' suffix, and naive query cutoffs don't sort correctly against each
+    other. Bare dates (all-day events) are taken as local midnight in
+    USER_TIMEZONE so they sort into the right local day."""
+    if not iso_str:
+        return ""
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return iso_str
+    if dt.tzinfo is None:
+        if all_day and "T" not in iso_str:
+            dt = dt.replace(tzinfo=config.USER_TIMEZONE)
+        else:
+            dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
+
+
+def utc_now_str() -> str:
+    """Current time in the canonical storage format."""
+    return datetime.utcnow().isoformat(timespec="seconds")
+
+
+def local_day_range(offset_days: int = 0, span_days: int = 1) -> tuple[str, str]:
+    """[start, end) of a span of local-timezone days, as storage strings.
+
+    'Today' means today in USER_TIMEZONE — computing day boundaries at UTC
+    midnight put the boundary at 7/8 PM ET and showed the wrong day's events
+    every evening."""
+    now_local = datetime.now(config.USER_TIMEZONE)
+    start_local = (now_local + timedelta(days=offset_days)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    end_local = start_local + timedelta(days=span_days)
+    return to_utc_storage(start_local.isoformat()), to_utc_storage(end_local.isoformat())
 
 
 def get_db() -> sqlite3.Connection:
@@ -74,12 +116,38 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_events_start ON events(start_time);
         CREATE INDEX IF NOT EXISTS idx_events_source ON events(source, source_id);
     """)
+    _migrate_timestamps_v1(conn)
     conn.close()
+
+
+def _migrate_timestamps_v1(conn: sqlite3.Connection):
+    """One-time rewrite of start_time/end_time into the canonical storage
+    format (rows written before to_utc_storage existed carry provider-native
+    offsets). Idempotent via PRAGMA user_version."""
+    if conn.execute("PRAGMA user_version").fetchone()[0] >= 1:
+        return
+    changed = 0
+    for row in conn.execute("SELECT id, start_time, end_time, all_day FROM events").fetchall():
+        ns = to_utc_storage(row["start_time"], bool(row["all_day"]))
+        ne = to_utc_storage(row["end_time"], bool(row["all_day"]))
+        if ns != row["start_time"] or ne != row["end_time"]:
+            conn.execute(
+                "UPDATE events SET start_time=?, end_time=? WHERE id=?",
+                (ns, ne, row["id"]),
+            )
+            changed += 1
+    conn.execute("PRAGMA user_version = 1")
+    conn.commit()
+    if changed:
+        import logging
+        logging.getLogger("chronicle.models").info(
+            f"Timestamp migration: normalized {changed} event row(s) to UTC storage format"
+        )
 
 
 def upsert_event(conn: sqlite3.Connection, event: dict) -> bool:
     """Upsert an event. Returns True if the event was actually changed (new or modified)."""
-    now = datetime.utcnow().isoformat()
+    now = utc_now_str()
 
     # Check if event exists and has changed
     existing = conn.execute(
@@ -98,29 +166,35 @@ def upsert_event(conn: sqlite3.Connection, event: dict) -> bool:
         if not changed:
             return False
 
+    # updated_at is written in the same Python format as synced_at so the
+    # webhook handlers can compare both against one cutoff string — sqlite's
+    # datetime('now') uses a space separator that never sorts against
+    # 'T'-separated isoformat values.
     conn.execute("""
         INSERT INTO events (id, source, source_id, calendar_id, title, description,
-                           location, start_time, end_time, all_day, status, raw_json, synced_at)
+                           location, start_time, end_time, all_day, status, raw_json,
+                           synced_at, updated_at)
         VALUES (:id, :source, :source_id, :calendar_id, :title, :description,
-                :location, :start_time, :end_time, :all_day, :status, :raw_json, :synced_at)
+                :location, :start_time, :end_time, :all_day, :status, :raw_json,
+                :synced_at, :updated_at)
         ON CONFLICT(source, source_id) DO UPDATE SET
             title=:title, description=:description, location=:location,
             start_time=:start_time, end_time=:end_time, all_day=:all_day,
             status=:status, raw_json=:raw_json, synced_at=:synced_at,
-            updated_at=datetime('now')
-    """, {**event, "synced_at": now})
+            updated_at=:updated_at
+    """, {**event, "synced_at": now, "updated_at": now})
     return True
 
 
 def get_upcoming_events(conn: sqlite3.Connection, hours: int = 24) -> list[dict]:
     now = datetime.utcnow()
-    horizon = (now + timedelta(hours=hours)).isoformat()
+    horizon = (now + timedelta(hours=hours)).isoformat(timespec="seconds")
     rows = conn.execute("""
         SELECT * FROM events
         WHERE start_time >= ? AND start_time < ? AND status != 'cancelled'
         ORDER BY start_time
         LIMIT 50
-    """, (now.isoformat(), horizon)).fetchall()
+    """, (now.isoformat(timespec="seconds"), horizon)).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -148,9 +222,9 @@ def mark_orphans_cancelled(conn: sqlite3.Connection, source: str, calendar_id: s
     for r in candidates:
         if r["source_id"] not in observed_ids:
             conn.execute(
-                "UPDATE events SET status='cancelled', updated_at=datetime('now') "
+                "UPDATE events SET status='cancelled', updated_at=? "
                 "WHERE source=? AND source_id=?",
-                (source, r["source_id"])
+                (utc_now_str(), source, r["source_id"])
             )
             reaped += 1
     return reaped

@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 import httpx
 
 import config
-from models import get_db, get_upcoming_events, get_events_range, to_local
+from models import get_db, get_upcoming_events, get_events_range, to_local, to_utc_storage
 
 log = logging.getLogger("chronicle.llm")
 
@@ -183,16 +183,18 @@ Does this change create any real conflicts? Only flag overlaps or tight back-to-
 
 
 def analyze_period(period: str = "week") -> str | None:
-    """Analyze a week, month, or quarter of events."""
+    """Analyze a week, month, or quarter of events. Periods are bounded in
+    USER_TIMEZONE — a Sunday-evening weekly review should cover the local
+    week, not the UTC one."""
     conn = get_db()
-    now = datetime.utcnow()
+    now = datetime.now(config.USER_TIMEZONE)
 
     if period == "week":
-        start = now.replace(hour=0, minute=0, second=0)
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         end = start + timedelta(days=7)
         label = "This Week"
     elif period == "month":
-        start = now.replace(day=1, hour=0, minute=0, second=0)
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         if start.month == 12:
             end = start.replace(year=start.year + 1, month=1)
         else:
@@ -200,7 +202,7 @@ def analyze_period(period: str = "week") -> str | None:
         label = now.strftime("%B %Y")
     elif period == "quarter":
         q_month = ((now.month - 1) // 3) * 3 + 1
-        start = now.replace(month=q_month, day=1, hour=0, minute=0, second=0)
+        start = now.replace(month=q_month, day=1, hour=0, minute=0, second=0, microsecond=0)
         end_month = q_month + 3
         if end_month > 12:
             end = start.replace(year=start.year + 1, month=end_month - 12)
@@ -211,7 +213,7 @@ def analyze_period(period: str = "week") -> str | None:
     else:
         return None
 
-    events = get_events_range(conn, start.isoformat(), end.isoformat())
+    events = get_events_range(conn, to_utc_storage(start.isoformat()), to_utc_storage(end.isoformat()))
     conn.close()
 
     if not events:
@@ -262,16 +264,18 @@ Provide a {period}ly review:
 def parse_natural_language_event(text: str) -> list[dict]:
     """Use LLM to parse a natural language event description into structured data.
     Returns a list of events (may be multiple for recurring/multi-day requests)."""
+    tz_name = str(config.USER_TIMEZONE)
+    now_local = datetime.now(config.USER_TIMEZONE)
     prompt = f"""Parse this into calendar event(s). Return ONLY a valid JSON array of objects, each with:
 - summary (string)
-- start (ISO 8601 datetime string, assume America/New_York timezone)
+- start (ISO 8601 datetime string, assume {tz_name} timezone)
 - end (ISO 8601 datetime string, default to 1 hour after start if not specified)
 - description (string, optional)
 - location (string, optional)
 
 If the request describes multiple events (e.g., "every day Monday to Friday for two weeks"), create a separate object for EACH individual event with the correct date.
 
-Today is {datetime.utcnow().strftime('%A, %B %d %Y')}.
+Today is {now_local.strftime('%A, %B %d %Y')} and the current local time is {now_local.strftime('%I:%M %p')}.
 
 Text: "{text}"
 
