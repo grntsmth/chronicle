@@ -41,13 +41,16 @@ pip install -r requirements.txt
 # Provide config via env vars — see config.py for the full list:
 #   GOOGLE_CREDS_FILE, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID,
 #   DISCORD_BOT_TOKEN, DISCORD_WEBHOOK_URL, ANTHROPIC_API_KEY, OLLAMA_URL,
-#   USER_TIMEZONE (default America/New_York), USER_CONTEXT (see Personalization)
+#   USER_TIMEZONE (default America/New_York), USER_CONTEXT (see Personalization),
+#   CHRONICLE_API_TOKEN (bearer token for /api/* + OAuth starts — required,
+#   the private surface fails closed without it), CHRONICLE_WEBHOOK_SECRET
+#   (clientState echoed back by Microsoft Graph webhook notifications)
 export $(cat .env | xargs)
 
 uvicorn app:app --reload --port 8090
 ```
 
-Hit `/chronicle/oauth/google` and `/chronicle/oauth/outlook` once each to seed the OAuth tokens; refresh is handled thereafter. If a refresh token is revoked or a client secret expires, the next tokenless resync will reap any events that disappeared during the outage so the LLM stops referencing deleted events.
+Hit `/chronicle/oauth/google?token=$CHRONICLE_API_TOKEN` and `/chronicle/oauth/outlook?token=...` once each to seed the OAuth tokens; refresh is handled thereafter. The API endpoints under `/chronicle/api/` take the same token as `Authorization: Bearer`; OAuth callbacks are CSRF-protected via `state`, and only the callbacks, webhooks, and `/health` are served unauthenticated. If a refresh token is revoked or a client secret expires, the next tokenless resync will reap any events that disappeared during the outage so the LLM stops referencing deleted events.
 
 ## Personalization
 

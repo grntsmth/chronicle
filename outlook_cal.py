@@ -23,13 +23,14 @@ def get_msal_app() -> msal.ConfidentialClientApplication | None:
     )
 
 
-def get_auth_url() -> str | None:
+def get_auth_url(state: str | None = None) -> str | None:
     app = get_msal_app()
     if not app:
         return None
     return app.get_authorization_request_url(
         scopes=["Calendars.ReadWrite"],
         redirect_uri=config.AZURE_REDIRECT_URI,
+        state=state,
     )
 
 
@@ -264,7 +265,7 @@ def setup_webhook() -> dict | None:
         "notificationUrl": our_url,
         "resource": "me/events",
         "expirationDateTime": expiry,
-        "clientState": "chronicle-outlook-webhook",
+        "clientState": config.OUTLOOK_CLIENT_STATE,
     }
 
     headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}

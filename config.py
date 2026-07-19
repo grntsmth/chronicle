@@ -41,6 +41,14 @@ CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama-relay:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:9b")
 
+# --- Security ---
+# Bearer token guarding /chronicle/api/* and the OAuth start endpoints.
+# Unset = those endpoints fail closed (503) rather than serve the internet.
+API_TOKEN = os.getenv("CHRONICLE_API_TOKEN", "")
+# Shared secret Microsoft Graph echoes back in webhook notifications; rotated
+# into the subscription on every setup_webhook run.
+OUTLOOK_CLIENT_STATE = os.getenv("CHRONICLE_WEBHOOK_SECRET", "chronicle-outlook-webhook")
+
 # --- Chronicle ---
 DB_PATH = os.getenv("CHRONICLE_DB", str(BASE_DIR / "data" / "chronicle.db"))
 SYNC_INTERVAL_MINUTES = int(os.getenv("SYNC_INTERVAL_MINUTES", "10"))

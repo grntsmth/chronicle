@@ -1,9 +1,11 @@
 import logging
 import asyncio
+import secrets
+import time
 from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request, Response, Query
+from fastapi import FastAPI, Request, Response, Query, HTTPException, Depends
 from fastapi.responses import RedirectResponse, PlainTextResponse
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -140,9 +142,49 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="The Chronicle", lifespan=lifespan)
 
 
+# --- Auth ---
+
+def require_token(request: Request):
+    """Bearer-token gate for the private surface (/api/*, OAuth starts).
+
+    Accepts `Authorization: Bearer <token>` or `?token=<token>` (the latter so
+    the OAuth start URLs work from a browser). Fails closed when no token is
+    configured — these endpoints are reachable from the public internet."""
+    if not config.API_TOKEN:
+        raise HTTPException(status_code=503, detail="CHRONICLE_API_TOKEN not configured")
+    supplied = request.query_params.get("token", "")
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        supplied = auth_header[7:]
+    if not secrets.compare_digest(supplied, config.API_TOKEN):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+# OAuth CSRF states: state -> issue time. Single-process app, so in-memory is
+# fine; a pod restart mid-flow just means redoing the (rare) OAuth dance.
+_oauth_states: dict[str, float] = {}
+_OAUTH_STATE_TTL = 600
+
+
+def _issue_oauth_state() -> str:
+    now = time.time()
+    for s, ts in list(_oauth_states.items()):
+        if now - ts > _OAUTH_STATE_TTL:
+            del _oauth_states[s]
+    state = secrets.token_urlsafe(24)
+    _oauth_states[state] = now
+    return state
+
+
+def _consume_oauth_state(state: str | None) -> bool:
+    if not state:
+        return False
+    return _oauth_states.pop(state, None) is not None
+
+
 # --- OAuth Endpoints ---
 
-@app.get("/chronicle/oauth/google")
+@app.get("/chronicle/oauth/google", dependencies=[Depends(require_token)])
 async def oauth_google():
     """Start Google OAuth flow."""
     flow = google_cal.get_oauth_flow()
@@ -150,6 +192,7 @@ async def oauth_google():
         access_type="offline",
         include_granted_scopes="true",
         prompt="consent",
+        state=_issue_oauth_state(),
     )
     return RedirectResponse(auth_url)
 
@@ -157,6 +200,8 @@ async def oauth_google():
 @app.get("/chronicle/oauth/callback")
 async def oauth_google_callback(code: str = Query(...), state: str = Query(None)):
     """Google OAuth callback."""
+    if not _consume_oauth_state(state):
+        raise HTTPException(status_code=400, detail="Invalid or expired OAuth state")
     flow = google_cal.get_oauth_flow()
     flow.fetch_token(code=code)
     google_cal.save_credentials(flow.credentials)
@@ -175,18 +220,20 @@ async def oauth_google_callback(code: str = Query(...), state: str = Query(None)
     return PlainTextResponse(f"Google Calendar connected! Synced {count} events. You can close this tab.")
 
 
-@app.get("/chronicle/oauth/outlook")
+@app.get("/chronicle/oauth/outlook", dependencies=[Depends(require_token)])
 async def oauth_outlook():
     """Start Outlook OAuth flow."""
-    auth_url = outlook_cal.get_auth_url()
+    auth_url = outlook_cal.get_auth_url(state=_issue_oauth_state())
     if not auth_url:
         return PlainTextResponse("Outlook not configured (missing Azure credentials)", status_code=503)
     return RedirectResponse(auth_url)
 
 
 @app.get("/chronicle/oauth/outlook/callback")
-async def oauth_outlook_callback(code: str = Query(...)):
+async def oauth_outlook_callback(code: str = Query(...), state: str = Query(None)):
     """Outlook OAuth callback."""
+    if not _consume_oauth_state(state):
+        raise HTTPException(status_code=400, detail="Invalid or expired OAuth state")
     result = outlook_cal.exchange_code(code)
     if not result:
         return PlainTextResponse("Outlook authentication failed", status_code=400)
@@ -244,7 +291,9 @@ async def webhook_google(request: Request):
         recent = [e for e in recent if dict(e).get("source_id", "") not in discord_bot_client.recently_created]
 
     if recent:
-        upcoming = models.get_upcoming_events(models.get_db(), 48)
+        conn = models.get_db()
+        upcoming = models.get_upcoming_events(conn, 48)
+        conn.close()
         for event in recent:
             event_dict = dict(event)
             discord_bot.notify_event_change(event_dict, "updated")
@@ -265,7 +314,20 @@ async def webhook_outlook(request: Request):
         return PlainTextResponse(params["validationToken"])
 
     body = await request.json()
-    log.info(f"Outlook webhook: {len(body.get('value', []))} notifications")
+    notifications = body.get("value", [])
+
+    # Graph echoes back the clientState we registered; anything else is not
+    # from our subscription (endpoint is public — anyone can POST here).
+    valid = [
+        n for n in notifications
+        if secrets.compare_digest(n.get("clientState", ""), config.OUTLOOK_CLIENT_STATE)
+    ]
+    if not valid:
+        if notifications:
+            log.warning(f"Outlook webhook: rejected {len(notifications)} notification(s) with bad clientState")
+        return Response(status_code=200)
+
+    log.info(f"Outlook webhook: {len(valid)} notifications")
 
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, outlook_cal.sync_calendar)
@@ -279,7 +341,9 @@ async def webhook_outlook(request: Request):
     conn.close()
 
     if recent:
-        upcoming = models.get_upcoming_events(models.get_db(), 48)
+        conn = models.get_db()
+        upcoming = models.get_upcoming_events(conn, 48)
+        conn.close()
         for event in recent:
             event_dict = dict(event)
             discord_bot.notify_event_change(event_dict, "updated")
@@ -292,7 +356,7 @@ async def webhook_outlook(request: Request):
 
 # --- API / Discord Command Endpoints ---
 
-@app.get("/chronicle/api/today")
+@app.get("/chronicle/api/today", dependencies=[Depends(require_token)])
 async def api_today():
     """Get today's events."""
     conn = models.get_db()
@@ -304,7 +368,7 @@ async def api_today():
     return {"events": events, "count": len(events)}
 
 
-@app.get("/chronicle/api/upcoming")
+@app.get("/chronicle/api/upcoming", dependencies=[Depends(require_token)])
 async def api_upcoming(hours: int = Query(24)):
     """Get upcoming events."""
     conn = models.get_db()
@@ -313,7 +377,7 @@ async def api_upcoming(hours: int = Query(24)):
     return {"events": events, "count": len(events)}
 
 
-@app.post("/chronicle/api/add")
+@app.post("/chronicle/api/add", dependencies=[Depends(require_token)])
 async def api_add_event(request: Request):
     """Add an event from natural language or structured data."""
     body = await request.json()
@@ -325,7 +389,7 @@ async def api_add_event(request: Request):
     if text:
         parsed_list = await loop.run_in_executor(None, llm.parse_natural_language_event, text)
         if not parsed_list:
-            return {"error": "Could not parse event from text"}, 400
+            raise HTTPException(status_code=400, detail="Could not parse event from text")
     else:
         parsed_list = [body]
 
@@ -350,10 +414,10 @@ async def api_add_event(request: Request):
 
     if created:
         return {"status": "created", "count": len(created), "events": created}
-    return {"error": "Failed to create any events"}, 500
+    raise HTTPException(status_code=500, detail="Failed to create any events")
 
 
-@app.post("/chronicle/api/analyze")
+@app.post("/chronicle/api/analyze", dependencies=[Depends(require_token)])
 async def api_analyze(hours: int = Query(24)):
     """Run LLM analysis on upcoming schedule."""
     loop = asyncio.get_event_loop()
@@ -361,7 +425,7 @@ async def api_analyze(hours: int = Query(24)):
     if analysis:
         await loop.run_in_executor(None, discord_bot.send_llm_analysis, analysis, "On-Demand Analysis")
         return {"analysis": analysis}
-    return {"error": "Analysis failed"}, 500
+    raise HTTPException(status_code=500, detail="Analysis failed")
 
 
 @app.get("/chronicle/health")
