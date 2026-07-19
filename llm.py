@@ -4,6 +4,7 @@ import logging
 from datetime import datetime, timedelta
 
 import httpx
+from pydantic import BaseModel
 
 import config
 from models import get_db, get_upcoming_events, get_events_range, to_local, to_utc_storage
@@ -261,45 +262,67 @@ Provide a {period}ly review:
     return query_llm(prompt, SYSTEM_PROMPT, max_tokens=4096)
 
 
-def parse_natural_language_event(text: str) -> list[dict]:
-    """Use LLM to parse a natural language event description into structured data.
-    Returns a list of events (may be multiple for recurring/multi-day requests)."""
+# --- Natural-language event parsing ---
+
+class ParsedEvent(BaseModel):
+    summary: str
+    start: str  # ISO 8601 with UTC offset
+    end: str
+    description: str = ""
+    location: str = ""
+
+
+class ParsedEventList(BaseModel):
+    events: list[ParsedEvent]
+
+
+def _parse_prompt(text: str) -> str:
     tz_name = str(config.USER_TIMEZONE)
     now_local = datetime.now(config.USER_TIMEZONE)
-    prompt = f"""Parse this into calendar event(s). Return ONLY a valid JSON array of objects, each with:
-- summary (string)
-- start (ISO 8601 datetime string, assume {tz_name} timezone)
-- end (ISO 8601 datetime string, default to 1 hour after start if not specified)
-- description (string, optional)
-- location (string, optional)
-
-If the request describes multiple events (e.g., "every day Monday to Friday for two weeks"), create a separate object for EACH individual event with the correct date.
+    offset_example = now_local.strftime("%z")
+    offset_example = f"{offset_example[:3]}:{offset_example[3:]}"
+    return f"""Parse this into calendar event(s):
+- start/end MUST be ISO 8601 datetimes WITH the UTC offset for {tz_name} (e.g. 2026-07-21T15:00:00{offset_example}).
+- end defaults to 1 hour after start if not specified.
+- If the request describes multiple events (e.g. "every day Monday to Friday for two weeks"), emit a separate event for EACH occurrence with the correct date.
 
 Today is {now_local.strftime('%A, %B %d %Y')} and the current local time is {now_local.strftime('%I:%M %p')}.
 
 Text: "{text}"
+"""
 
-JSON array:"""
 
-    system = "You are a precise date/time parser. Return only a valid JSON array, no explanation."
-    result = query_llm(prompt, system, max_tokens=4096)
+def _parse_with_claude(client, text: str) -> list[dict]:
+    """Structured outputs: the API guarantees the response validates against
+    the schema — no JSON scraping or retry heuristics needed."""
+    resp = client.messages.parse(
+        model=config.CLAUDE_MODEL,
+        max_tokens=4096,
+        system="You are a precise date/time parser for a calendar assistant.",
+        messages=[{"role": "user", "content": _parse_prompt(text)}],
+        output_format=ParsedEventList,
+    )
+    events = resp.parsed_output.events
+    log.info(f"Structured parse via Claude: {len(events)} event(s)")
+    return [e.model_dump() for e in events]
+
+
+def _parse_with_ollama(text: str) -> list[dict]:
+    """Fallback for when no Anthropic API key is configured: prompt for a JSON
+    array and scrape it out of the completion."""
+    prompt = _parse_prompt(text) + "\nReturn ONLY a valid JSON array of objects with keys: summary, start, end, description, location.\n\nJSON array:"
+    result = query_ollama(prompt, "You are a precise date/time parser. Return only a valid JSON array, no explanation.")
     if not result:
-        log.error("LLM returned empty response for event parsing")
+        log.error("Ollama returned empty response for event parsing")
         return []
-
-    log.info(f"LLM parse response: {result[:300]}")
-
-    # Try to extract JSON array
+    log.info(f"Ollama parse response: {result[:300]}")
     try:
-        # Find array
         arr_start = result.find("[")
         arr_end = result.rfind("]") + 1
         if arr_start >= 0 and arr_end > arr_start:
             parsed = json.loads(result[arr_start:arr_end])
             if isinstance(parsed, list):
                 return parsed
-
-        # Fallback: try single object
         obj_start = result.find("{")
         obj_end = result.rfind("}") + 1
         if obj_start >= 0 and obj_end > obj_start:
@@ -307,5 +330,17 @@ JSON array:"""
             if isinstance(parsed, dict):
                 return [parsed]
     except json.JSONDecodeError:
-        log.error(f"Failed to parse LLM event response: {result}")
+        log.error(f"Failed to parse Ollama event response: {result}")
     return []
+
+
+def parse_natural_language_event(text: str) -> list[dict]:
+    """Parse a natural-language event description into structured data.
+    Returns a list of events (may be multiple for recurring/multi-day requests)."""
+    client = get_claude()
+    if client:
+        try:
+            return _parse_with_claude(client, text)
+        except Exception as e:
+            log.error(f"Structured parse failed, falling back to Ollama: {e}")
+    return _parse_with_ollama(text)

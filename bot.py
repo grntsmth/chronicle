@@ -12,6 +12,7 @@ import outlook_cal
 import discord_bot
 import llm
 import voice
+import agent
 
 log = logging.getLogger("chronicle.bot")
 
@@ -82,62 +83,32 @@ async def handle_voice_message(message, attachment):
     # Show what we heard
     await message.reply(f"*\"{transcript}\"*\n\nProcessing...")
 
-    # Route the transcription
-    text = transcript.strip().lower()
+    # The tool-using agent routes the request itself: it can list events,
+    # create, delete, and find free time. (Replaced the old keyword table.)
+    await send_agent_reply(message.channel, transcript.strip())
 
-    if any(w in text for w in ["today", "today's", "what's today"]):
-        ctx = await bot.get_context(message)
-        await cmd_today(ctx)
-    elif any(w in text for w in ["tomorrow", "tomorrow's"]):
-        ctx = await bot.get_context(message)
-        await cmd_tomorrow(ctx)
-    elif any(w in text for w in ["this week", "my week", "week look"]):
-        ctx = await bot.get_context(message)
-        await cmd_week(ctx)
-    elif any(w in text for w in ["review week", "weekly review"]):
-        ctx = await bot.get_context(message)
-        await cmd_review(ctx, "week")
-    elif any(w in text for w in ["review month", "monthly review"]):
-        ctx = await bot.get_context(message)
-        await cmd_review(ctx, "month")
-    elif any(w in text for w in ["review quarter", "quarterly review"]):
-        ctx = await bot.get_context(message)
-        await cmd_review(ctx, "quarter")
-    elif any(w in text for w in ["analyze", "analysis", "schedule analysis"]):
-        ctx = await bot.get_context(message)
-        hours = 96 if "week" in text else 24
-        await cmd_analyze(ctx, hours)
-    elif any(w in text for w in ["add ", "schedule ", "create ", "new event", "put "]):
-        ctx = await bot.get_context(message)
-        # Use the original (not lowered) transcript for the event details
-        await cmd_add(ctx, text=transcript.strip())
-    elif any(w in text for w in ["status", "connected", "connections"]):
-        ctx = await bot.get_context(message)
-        await cmd_status(ctx)
-    elif any(w in text for w in ["sync", "refresh"]):
-        ctx = await bot.get_context(message)
-        await cmd_sync(ctx)
-    else:
-        # Free-form question — send to LLM with calendar context
-        analysis = await loop.run_in_executor(None, llm.analyze_schedule, 168)
-        prompt = f"""The user said (via voice): "{transcript}"
 
-Here is their current schedule context:
-{analysis}
+async def send_agent_reply(channel, user_text: str):
+    """Run the tool-using agent and post its reply as an embed."""
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, agent.run_agent, user_text)
 
-Respond to their question or request conversationally and helpfully."""
+    # Suppress duplicate webhook notifications for events the agent created
+    for event_id in result["created_ids"]:
+        recently_created.add(event_id)
 
-        response = await loop.run_in_executor(None, llm.query_llm, prompt, llm.SYSTEM_PROMPT, 1024)
-        if response:
-            embed = discord.Embed(
-                title="Chronicle",
-                description=response[:3900],
-                color=discord_bot.AMBER,
-            )
-            embed.set_footer(text="The Chronicle")
-            await message.channel.send(embed=embed)
-        else:
-            await message.reply("I heard you but couldn't process that. Try a command like `!help`.")
+        async def _cleanup(eid=event_id):
+            await asyncio.sleep(60)
+            recently_created.discard(eid)
+        asyncio.create_task(_cleanup())
+
+    embed = discord.Embed(
+        title="Chronicle",
+        description=result["reply"][:3900],
+        color=discord_bot.AMBER,
+    )
+    embed.set_footer(text="The Chronicle")
+    await channel.send(embed=embed)
 
 
 @bot.command(name="help")
@@ -153,6 +124,8 @@ async def cmd_help(ctx):
             "**!upcoming [hours]** — Next N hours (default 24)\n"
             "**!add [text]** — Add event via natural language (Google)\n"
             "**!add outlook [text]** — Add event to Outlook\n"
+            "**!ask [anything]** — Assistant with tools: check, create,\n"
+            "  delete events, find free time (voice messages go here too)\n"
             "**!analyze [hours]** — LLM schedule analysis\n"
             "**!review week** — Weekly review\n"
             "**!review month** — Monthly review\n"
@@ -386,6 +359,13 @@ async def cmd_add(ctx, *, text: str):
         await ctx.send(embed=embed)
     else:
         await ctx.send("Failed to create any events. Check the logs.")
+
+
+@bot.command(name="ask")
+async def cmd_ask(ctx, *, text: str):
+    """Free-form request handled by the tool-using agent."""
+    await ctx.send("Consulting the Chronicle...")
+    await send_agent_reply(ctx.channel, text)
 
 
 @bot.command(name="analyze")

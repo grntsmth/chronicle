@@ -10,6 +10,7 @@ Built to solve a personal problem — my work calendar (Outlook) and personal ca
 - **Stores** events in a local SQLite DB (`models.py` — stdlib `sqlite3`), keyed on `(source, source_id)`. Event titles, times, locations, and descriptions are all retained and surfaced to the LLM during analysis.
 - **Posts** a morning briefing to Discord at 7 AM ET with the day's events, flagged conflicts, and an LLM-generated "what to pay attention to" note. Weekly and monthly reviews run on cron.
 - **Responds** to Discord prefix commands (`!today`, `!week`, `!add`, `!analyze`, `!review`) for ad-hoc queries.
+- **Acts** as a tool-using agent (`!ask`, and any voice message): Claude drives an agentic loop over `list_events` / `create_calendar_event` / `delete_event` / `find_free_time` tools, so "move my dentist appointment" or "when am I free for 2 hours this week?" work conversationally. Event parsing for `!add` uses structured outputs — the API guarantees schema-valid JSON, no scraping.
 
 ## Stack
 

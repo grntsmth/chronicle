@@ -6,7 +6,7 @@ import msal
 import httpx
 
 import config
-from models import get_db, upsert_event, mark_orphans_cancelled, to_utc_storage
+from models import get_db, upsert_event, mark_orphans_cancelled, to_utc_storage, utc_now_str
 
 log = logging.getLogger("chronicle.outlook")
 
@@ -190,6 +190,18 @@ def sync_calendar() -> int:
     return count
 
 
+def _wall_time(iso: str) -> str:
+    """Graph wants a tz-naive wall-clock dateTime paired with the timeZone
+    field; convert any offset-aware input to USER_TIMEZONE wall time."""
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return iso
+    if dt.tzinfo:
+        dt = dt.astimezone(config.USER_TIMEZONE).replace(tzinfo=None)
+    return dt.isoformat()
+
+
 def create_event(subject: str, start: str, end: str, description: str = "",
                  location: str = "") -> dict | None:
     access_token = get_access_token()
@@ -198,8 +210,8 @@ def create_event(subject: str, start: str, end: str, description: str = "",
 
     body = {
         "subject": subject,
-        "start": {"dateTime": start, "timeZone": str(config.USER_TIMEZONE)},
-        "end": {"dateTime": end, "timeZone": str(config.USER_TIMEZONE)},
+        "start": {"dateTime": _wall_time(start), "timeZone": str(config.USER_TIMEZONE)},
+        "end": {"dateTime": _wall_time(end), "timeZone": str(config.USER_TIMEZONE)},
     }
     if description:
         body["body"] = {"contentType": "Text", "content": description}
@@ -220,6 +232,27 @@ def create_event(subject: str, start: str, end: str, description: str = "",
 
     log.error(f"Failed to create Outlook event: {resp.status_code} {resp.text}")
     return None
+
+
+def delete_event(source_id: str) -> bool:
+    """Delete an event from the Outlook calendar and mark it cancelled locally."""
+    access_token = get_access_token()
+    if not access_token:
+        return False
+    headers = {"Authorization": f"Bearer {access_token}"}
+    resp = httpx.delete(f"{GRAPH_BASE}/me/events/{source_id}", headers=headers)
+    if resp.status_code in (204, 404):
+        conn = get_db()
+        conn.execute(
+            "UPDATE events SET status='cancelled', updated_at=? WHERE source='outlook' AND source_id=?",
+            (utc_now_str(), source_id),
+        )
+        conn.commit()
+        conn.close()
+        log.info(f"Deleted Outlook event: {source_id[:32]}")
+        return True
+    log.error(f"Failed to delete Outlook event {source_id[:32]}: {resp.status_code} {resp.text}")
+    return False
 
 
 def list_subscriptions(access_token: str) -> list[dict]:
