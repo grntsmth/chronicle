@@ -207,6 +207,53 @@ def get_events_range(conn: sqlite3.Connection, start: str, end: str) -> list[dic
     return [dict(r) for r in rows]
 
 
+def find_conflicts(events: list[dict], tight_gap_minutes: int = 15) -> list[dict]:
+    """Deterministic conflict detection over event dicts.
+
+    Returns overlap and tight-gap pairs as
+    {"type": "overlap"|"tight_gap", "first": a, "second": b, "gap_minutes": n}
+    where "first" starts earlier. All-day events are skipped — they aren't
+    time commitments in the overlap sense. Computed in code so the briefing
+    never depends on an LLM doing timestamp arithmetic."""
+    timed = []
+    for e in events:
+        if e.get("all_day"):
+            continue
+        s = to_local(e.get("start_time"))
+        en = to_local(e.get("end_time"))
+        if s and en and en > s:
+            timed.append((s, en, e))
+    timed.sort(key=lambda t: t[0])
+
+    conflicts = []
+    for i, (s1, e1, a) in enumerate(timed):
+        for s2, e2, b in timed[i + 1:]:
+            if s2 >= e1 + timedelta(minutes=tight_gap_minutes):
+                break  # sorted by start: nothing later can conflict with a
+            if s2 < e1:
+                conflicts.append({"type": "overlap", "first": a, "second": b, "gap_minutes": 0})
+            else:
+                gap = int((s2 - e1).total_seconds() // 60)
+                conflicts.append({"type": "tight_gap", "first": a, "second": b, "gap_minutes": gap})
+    return conflicts
+
+
+def describe_conflicts(conflicts: list[dict]) -> list[str]:
+    """Plain-text one-liners for LLM prompts and logs."""
+    lines = []
+    for c in conflicts:
+        a, b = c["first"], c["second"]
+        a_t = to_local(a.get("start_time"))
+        b_t = to_local(b.get("start_time"))
+        a_s = a_t.strftime("%a %I:%M %p") if a_t else "?"
+        b_s = b_t.strftime("%a %I:%M %p") if b_t else "?"
+        if c["type"] == "overlap":
+            lines.append(f"OVERLAP: '{a['title']}' ({a_s}, {a['source']}) overlaps '{b['title']}' ({b_s}, {b['source']})")
+        else:
+            lines.append(f"TIGHT GAP: only {c['gap_minutes']} min between '{a['title']}' ({a_s}) and '{b['title']}' ({b_s})")
+    return lines
+
+
 def mark_orphans_cancelled(conn: sqlite3.Connection, source: str, calendar_id: str,
                             time_min: str, time_max: str, observed_ids: set) -> int:
     """Mark confirmed events in the [time_min, time_max) window as cancelled if their

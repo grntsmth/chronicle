@@ -7,7 +7,8 @@ import httpx
 from pydantic import BaseModel
 
 import config
-from models import get_db, get_upcoming_events, get_events_range, to_local, to_utc_storage
+from models import (get_db, get_upcoming_events, get_events_range, to_local,
+                    to_utc_storage, find_conflicts, describe_conflicts)
 
 log = logging.getLogger("chronicle.llm")
 
@@ -126,14 +127,23 @@ def analyze_schedule(hours: int = 24) -> str | None:
         desc_part = f" — {desc[:200]}" if desc else ""
         event_lines.append(f"- {time_str}: {e['title']} ({e['source']}){' @ ' + e['location'] if e['location'] else ''}{desc_part}")
 
+    # Conflicts are computed deterministically and handed to the model as
+    # facts — LLMs doing timestamp arithmetic both miss real overlaps and
+    # invent phantom ones.
+    conflict_lines = describe_conflicts(find_conflicts(events))
+    conflict_text = "\n".join(f"- {l}" for l in conflict_lines) if conflict_lines else "None detected."
+
     now_local = datetime.now(config.USER_TIMEZONE)
     prompt = f"""Here are the upcoming events for the next {hours} hours:
 
 {chr(10).join(event_lines)}
 
+Scheduling conflicts (computed from the timestamps — treat as authoritative, do not re-derive or add others):
+{conflict_text}
+
 Current time: {now_local.strftime('%A, %B %d %Y %I:%M %p %Z')}
 
-Analyze this schedule. Identify conflicts, suggest optimizations, and note any preparation needed."""
+Analyze this schedule. Advise how to handle any listed conflicts, suggest optimizations, and note any preparation needed."""
 
     return query_llm(prompt, SYSTEM_PROMPT)
 
@@ -167,6 +177,16 @@ def analyze_change(event: dict, change_type: str, all_events: list[dict], window
         desc_part = f" — {desc[:200]}" if desc else ""
         other_lines.append(f"- {time_str}: {e['title']}{desc_part}")
 
+    # Deterministic check: does the changed event overlap/crowd anything?
+    pair_conflicts = [
+        c for c in find_conflicts([event] + [e for _, e in nearby])
+        if c["first"].get("id") == event.get("id") or c["second"].get("id") == event.get("id")
+    ]
+    if pair_conflicts:
+        conflict_text = "\n".join(f"- {l}" for l in describe_conflicts(pair_conflicts))
+    else:
+        conflict_text = "None — the change does not overlap or crowd any nearby event."
+
     change_time_str = change_dt.strftime("%a %b %d %Y, %I:%M %p %Z")
     end_dt = to_local(event.get("end_time"))
     end_str = end_dt.strftime("%I:%M %p %Z") if end_dt else event.get("end_time", "?")
@@ -178,7 +198,10 @@ def analyze_change(event: dict, change_type: str, all_events: list[dict], window
 Other events within ±{window_hours}h of that time:
 {chr(10).join(other_lines)}
 
-Does this change create any real conflicts? Only flag overlaps or tight back-to-backs on the SAME DAY as the change. Events on different days are not conflicts. If no issues, say so briefly."""
+Conflicts involving the changed event (computed from the timestamps — treat as authoritative, do not re-derive or add others):
+{conflict_text}
+
+If conflicts are listed, explain the impact and suggest how to resolve them. If none, say all clear in one short sentence."""
 
     return query_llm(prompt, SYSTEM_PROMPT)
 

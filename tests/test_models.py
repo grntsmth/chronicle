@@ -149,5 +149,57 @@ class UpsertAndMigration(unittest.TestCase):
         self.assertEqual(self.conn.execute("PRAGMA user_version").fetchone()[0], 1)
 
 
+class ConflictDetection(unittest.TestCase):
+    """find_conflicts: July dates, ET = UTC-4, storage is naive UTC."""
+
+    def _ev(self, sid, start, end, all_day=0, title=None):
+        return _event(sid, start, end, title=title or sid, all_day=all_day)
+
+    def test_overlap_detected(self):
+        # 9-11 AM ET vs 10 AM-12 PM ET
+        a = self._ev("a", "2026-07-21T13:00:00", "2026-07-21T15:00:00")
+        b = self._ev("b", "2026-07-21T14:00:00", "2026-07-21T16:00:00")
+        conflicts = models.find_conflicts([b, a])  # unsorted input
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(conflicts[0]["type"], "overlap")
+        self.assertEqual(conflicts[0]["first"]["title"], "a")  # earlier start first
+
+    def test_tight_gap_detected_with_minutes(self):
+        a = self._ev("a", "2026-07-21T13:00:00", "2026-07-21T15:00:00")
+        b = self._ev("b", "2026-07-21T15:10:00", "2026-07-21T16:00:00")
+        conflicts = models.find_conflicts([a, b], tight_gap_minutes=15)
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(conflicts[0]["type"], "tight_gap")
+        self.assertEqual(conflicts[0]["gap_minutes"], 10)
+
+    def test_comfortable_gap_is_not_a_conflict(self):
+        a = self._ev("a", "2026-07-21T13:00:00", "2026-07-21T15:00:00")
+        b = self._ev("b", "2026-07-21T16:00:00", "2026-07-21T17:00:00")
+        self.assertEqual(models.find_conflicts([a, b]), [])
+
+    def test_all_day_events_are_skipped(self):
+        allday = self._ev("holiday", "2026-07-21T04:00:00", "2026-07-22T04:00:00", all_day=1)
+        a = self._ev("a", "2026-07-21T13:00:00", "2026-07-21T15:00:00")
+        self.assertEqual(models.find_conflicts([allday, a]), [])
+
+    def test_chain_of_three(self):
+        # A 9-11 overlaps B 10-12; C starts 10 min after B ends
+        a = self._ev("a", "2026-07-21T13:00:00", "2026-07-21T15:00:00")
+        b = self._ev("b", "2026-07-21T14:00:00", "2026-07-21T16:00:00")
+        c = self._ev("c", "2026-07-21T16:10:00", "2026-07-21T17:00:00")
+        conflicts = models.find_conflicts([a, b, c])
+        kinds = {(x["first"]["title"], x["second"]["title"]): x["type"] for x in conflicts}
+        self.assertEqual(kinds, {("a", "b"): "overlap", ("b", "c"): "tight_gap"})
+
+    def test_describe_lines(self):
+        a = self._ev("Shift", "2026-07-21T13:00:00", "2026-07-21T15:00:00", title="JPMC Shift")
+        b = self._ev("Dentist", "2026-07-21T14:00:00", "2026-07-21T16:00:00", title="Dentist")
+        lines = models.describe_conflicts(models.find_conflicts([a, b]))
+        self.assertEqual(len(lines), 1)
+        self.assertIn("OVERLAP", lines[0])
+        self.assertIn("JPMC Shift", lines[0])
+        self.assertIn("Dentist", lines[0])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 import httpx
 
 import config
-from models import get_db, get_upcoming_events, get_events_range, to_local, local_day_range
+from models import get_db, get_upcoming_events, get_events_range, to_local, local_day_range, find_conflicts
 
 log = logging.getLogger("chronicle.discord")
 
@@ -101,11 +101,26 @@ def send_daily_briefing():
         lines.append(f"{source_icon} **{time_str}** — {e['title']}")
 
     now_local = datetime.now(config.USER_TIMEZONE)
+    fields = [{"name": "Date", "value": now_local.strftime("%A, %B %d %Y"), "inline": False}]
+
+    # Conflicts are computed in code, not left to the LLM — this field is
+    # correct even when both LLM backends are down.
+    conflicts = find_conflicts(events)
+    if conflicts:
+        clines = []
+        for c in conflicts:
+            a, b = c["first"], c["second"]
+            if c["type"] == "overlap":
+                clines.append(f"⛔ **{a['title']}** overlaps **{b['title']}**")
+            else:
+                clines.append(f"⏱️ **{a['title']}** → **{b['title']}**: only {c['gap_minutes']} min between")
+        fields.append({"name": "⚠️ Conflicts", "value": "\n".join(clines)[:1024], "inline": False})
+
     send_embed(
         title=f"Daily Briefing — {len(events)} Events",
         description="\n".join(lines),
-        color=AMBER,
-        fields=[{"name": "Date", "value": now_local.strftime("%A, %B %d %Y"), "inline": False}],
+        color=RED if conflicts else AMBER,
+        fields=fields,
     )
 
 
