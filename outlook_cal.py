@@ -6,6 +6,7 @@ import msal
 import httpx
 
 import config
+import metrics
 from models import get_db, upsert_event, mark_orphans_cancelled, to_utc_storage, utc_now_str
 
 log = logging.getLogger("chronicle.outlook")
@@ -132,6 +133,7 @@ def sync_calendar() -> int:
     access_token = get_access_token()
     if not access_token:
         log.warning("Outlook not authenticated")
+        metrics.SYNC_ERRORS.labels("outlook").inc()
         return 0
 
     conn = get_db()
@@ -179,9 +181,12 @@ def sync_calendar() -> int:
             ON CONFLICT(source, calendar_id) DO UPDATE SET last_sync=datetime('now')
         """)
         conn.commit()
+        metrics.SYNC_EVENTS.labels("outlook").inc(count)
+        metrics.SYNC_LAST_SUCCESS.labels("outlook").set_to_current_time()
 
     except Exception as e:
         log.error(f"Outlook sync error: {e}")
+        metrics.SYNC_ERRORS.labels("outlook").inc()
         conn.rollback()
     finally:
         conn.close()

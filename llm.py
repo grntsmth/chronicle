@@ -1,5 +1,6 @@
 import json
 import re
+import time
 import logging
 from datetime import datetime, timedelta
 
@@ -7,6 +8,7 @@ import httpx
 from pydantic import BaseModel
 
 import config
+import metrics
 from models import (get_db, get_upcoming_events, get_events_range, to_local,
                     to_utc_storage, find_conflicts, describe_conflicts)
 
@@ -29,6 +31,7 @@ def query_claude(prompt: str, system: str = "", max_tokens: int = 2048) -> str |
     client = get_claude()
     if not client:
         return None
+    t0 = time.monotonic()
     try:
         msg = client.messages.create(
             model=config.CLAUDE_MODEL,
@@ -36,10 +39,14 @@ def query_claude(prompt: str, system: str = "", max_tokens: int = 2048) -> str |
             system=system,
             messages=[{"role": "user", "content": prompt}],
         )
+        metrics.LLM_REQUESTS.labels("claude", "success").inc()
         return msg.content[0].text.strip()
     except Exception as e:
         log.error(f"Claude API failed: {e}")
+        metrics.LLM_REQUESTS.labels("claude", "error").inc()
         return None
+    finally:
+        metrics.LLM_LATENCY.labels("claude").observe(time.monotonic() - t0)
 
 
 # --- Ollama (fallback) ---
@@ -54,6 +61,7 @@ def query_ollama(prompt: str, system: str = "") -> str | None:
     if system:
         body["system"] = system
 
+    t0 = time.monotonic()
     try:
         resp = httpx.post(
             f"{config.OLLAMA_URL}/api/generate",
@@ -64,10 +72,14 @@ def query_ollama(prompt: str, system: str = "") -> str | None:
         result = resp.json().get("response", "").strip()
         # Strip qwen3 think tags
         result = re.sub(r'<think>.*?</think>', '', result, flags=re.DOTALL).strip()
+        metrics.LLM_REQUESTS.labels("ollama", "success").inc()
         return result
     except Exception as e:
         log.error(f"Ollama query failed: {e}")
+        metrics.LLM_REQUESTS.labels("ollama", "error").inc()
         return None
+    finally:
+        metrics.LLM_LATENCY.labels("ollama").observe(time.monotonic() - t0)
 
 
 # --- Unified query: Claude first, Ollama fallback ---
@@ -318,13 +330,21 @@ Text: "{text}"
 def _parse_with_claude(client, text: str) -> list[dict]:
     """Structured outputs: the API guarantees the response validates against
     the schema — no JSON scraping or retry heuristics needed."""
-    resp = client.messages.parse(
-        model=config.CLAUDE_MODEL,
-        max_tokens=4096,
-        system="You are a precise date/time parser for a calendar assistant.",
-        messages=[{"role": "user", "content": _parse_prompt(text)}],
-        output_format=ParsedEventList,
-    )
+    t0 = time.monotonic()
+    try:
+        resp = client.messages.parse(
+            model=config.CLAUDE_MODEL,
+            max_tokens=4096,
+            system="You are a precise date/time parser for a calendar assistant.",
+            messages=[{"role": "user", "content": _parse_prompt(text)}],
+            output_format=ParsedEventList,
+        )
+        metrics.LLM_REQUESTS.labels("claude", "success").inc()
+    except Exception:
+        metrics.LLM_REQUESTS.labels("claude", "error").inc()
+        raise
+    finally:
+        metrics.LLM_LATENCY.labels("claude").observe(time.monotonic() - t0)
     events = resp.parsed_output.events
     log.info(f"Structured parse via Claude: {len(events)} event(s)")
     return [e.model_dump() for e in events]

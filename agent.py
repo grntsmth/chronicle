@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, time as dtime
 from anthropic import beta_tool
 
 import config
+import metrics
 import models
 import google_cal
 import outlook_cal
@@ -218,6 +219,7 @@ Here is their current schedule context:
 
 Respond to their question or request conversationally and helpfully."""
         reply = llm.query_llm(prompt, llm.SYSTEM_PROMPT, 1024)
+        metrics.AGENT_RUNS.labels("fallback").inc()
         return {"reply": reply or "The Oracle is unavailable. Is Ollama running?", "created_ids": []}
 
     _created_ids.clear()
@@ -235,7 +237,9 @@ Respond to their question or request conversationally and helpfully."""
         reply = ""
         if final:
             reply = "".join(b.text for b in final.content if b.type == "text").strip()
+        metrics.AGENT_RUNS.labels("success").inc()
         return {"reply": reply or "Done (no further comment).", "created_ids": list(_created_ids)}
     except Exception as e:
         log.error(f"Agent run failed: {e}")
+        metrics.AGENT_RUNS.labels("error").inc()
         return {"reply": f"Something went wrong talking to the assistant: {e}", "created_ids": list(_created_ids)}

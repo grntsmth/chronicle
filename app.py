@@ -8,8 +8,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response, Query, HTTPException, Depends
 from fastapi.responses import RedirectResponse, PlainTextResponse
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
 import config
+import metrics
 import models
 import google_cal
 import outlook_cal
@@ -273,7 +275,9 @@ async def webhook_google(request: Request):
     conn.close()
     if row and row["channel_id"] and channel_id != row["channel_id"]:
         log.info(f"Google webhook: ignoring stale channel {channel_id} (current: {row['channel_id']})")
+        metrics.WEBHOOKS.labels("google", "stale").inc()
         return Response(status_code=200)
+    metrics.WEBHOOKS.labels("google", "processed").inc()
 
     # Something changed — do an incremental sync
     loop = asyncio.get_event_loop()
@@ -331,8 +335,10 @@ async def webhook_outlook(request: Request):
     if not valid:
         if notifications:
             log.warning(f"Outlook webhook: rejected {len(notifications)} notification(s) with bad clientState")
+            metrics.WEBHOOKS.labels("outlook", "rejected").inc(len(notifications))
         return Response(status_code=200)
 
+    metrics.WEBHOOKS.labels("outlook", "processed").inc(len(valid))
     log.info(f"Outlook webhook: {len(valid)} notifications")
 
     loop = asyncio.get_event_loop()
@@ -431,6 +437,26 @@ async def api_analyze(hours: int = Query(24)):
         await loop.run_in_executor(None, discord_bot.send_llm_analysis, analysis, "On-Demand Analysis")
         return {"analysis": analysis}
     raise HTTPException(status_code=500, detail="Analysis failed")
+
+
+@app.get("/chronicle/metrics")
+async def metrics_endpoint():
+    """Prometheus metrics. Unauthenticated like /health — aggregates only,
+    no event content."""
+    conn = models.get_db()
+    week_start = models.utc_now_str()
+    week_end = (datetime.utcnow() + timedelta(days=7)).isoformat(timespec="seconds")
+    for source in ("google", "outlook"):
+        n = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE source=? AND status != 'cancelled' "
+            "AND start_time >= ? AND start_time < ?",
+            (source, week_start, week_end),
+        ).fetchone()[0]
+        metrics.UPCOMING_EVENTS.labels(source).set(n)
+    next24 = models.get_upcoming_events(conn, 24)
+    conn.close()
+    metrics.CONFLICTS_24H.set(len(models.find_conflicts(next24)))
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/chronicle/health")

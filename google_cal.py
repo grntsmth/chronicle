@@ -9,6 +9,7 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 
 import config
+import metrics
 from models import get_db, upsert_event, mark_orphans_cancelled, to_utc_storage
 
 log = logging.getLogger("chronicle.google")
@@ -84,6 +85,7 @@ def sync_calendar(calendar_id: str = "primary") -> int:
     service = get_service()
     if not service:
         log.error("Google Calendar not authenticated")
+        metrics.SYNC_ERRORS.labels("google").inc()
         return 0
 
     conn = get_db()
@@ -153,6 +155,8 @@ def sync_calendar(calendar_id: str = "primary") -> int:
                 sync_token=?, last_sync=datetime('now')
         """, (calendar_id, new_sync_token, new_sync_token))
         conn.commit()
+        metrics.SYNC_EVENTS.labels("google").inc(count)
+        metrics.SYNC_LAST_SUCCESS.labels("google").set_to_current_time()
 
     except Exception as e:
         if "Sync token" in str(e) and "invalid" in str(e):
@@ -162,6 +166,7 @@ def sync_calendar(calendar_id: str = "primary") -> int:
             conn.close()
             return sync_calendar(calendar_id)
         log.error(f"Google sync error: {e}")
+        metrics.SYNC_ERRORS.labels("google").inc()
         conn.rollback()
     finally:
         conn.close()
